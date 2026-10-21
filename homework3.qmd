@@ -1,0 +1,639 @@
+---
+title: "STATS 506 · Homework 3"
+subtitle: "NHANES, Sakila, and Australian sample records"
+date: 2026-10-21
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show R code"
+    toc: true
+    number-sections: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+**GitHub repository:** [STATS 506 Homework 3](https://github.com/hebe233299-source/stats506-hw3)
+
+
+```{r setup}
+library(haven)
+library(DBI)
+library(RSQLite)
+library(knitr)
+library(microbenchmark)
+
+options(scipen = 4)
+set.seed(506)
+```
+
+# Problem 1 — NHANES audiometry
+
+## 1.1 Import and inner join
+
+```{r nhanes-import}
+aux <- as.data.frame(haven::read_xpt("data/AUX_I.xpt"))
+demo <- as.data.frame(haven::read_xpt("data/DEMO_I.xpt"))
+stopifnot(!anyDuplicated(aux$SEQN), !anyDuplicated(demo$SEQN))
+common_identifiers <- intersect(names(aux), names(demo))
+print(common_identifiers)
+
+nhanes <- as.data.frame(merge(aux, demo, by = "SEQN", all = FALSE))
+merged_dimensions <- dim(nhanes)
+print(merged_dimensions)
+```
+
+`SEQN` is the common, unique respondent identifier. An inner join retains only respondents present in both files. The resulting `data.frame` has **`r merged_dimensions[1]` rows and `r merged_dimensions[2]` columns**, as printed above.
+
+## 1.2 Clean the four predictors and outcomes
+
+The [DEMO_I codebook](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2015/DataFiles/DEMO_I.htm) codes gender as 1 male and 2 female; citizenship as 1 citizen, 2 noncitizen, 7 refused, and 9 don't know. Child count is 0, 1, 2, or 3, where **3 means 3 or more**. Income codes 77 and 99 are nonresponses. Codes 12 (at least $20,000) and 13 (under $20,000) overlap the narrower income bands; codes 14 and 15 are $75,000–$99,999 and at least $100,000. Therefore the raw code is not a valid continuous scale.
+
+I retain labeled income categories for description. For regression, `income_lower_10k` is each nonoverlapping category's **lower bound in units of $10,000**. This is a documented proxy, not an assigned exact income: the top band is represented by its $100,000 lower bound. Codes 12 and 13 are `NA` on this numeric measure because no unique narrower band can be assigned; they are excluded only from models requiring numeric income. Code 3 for children is used numerically as the recorded, top-coded value, so its coefficient is an approximation for households with at least three young children.
+
+```{r nhanes-clean}
+income_codes <- c(1:10, 12:15)
+income_labels <- c(
+  "$0–4,999", "$5,000–9,999", "$10,000–14,999",
+  "$15,000–19,999", "$20,000–24,999", "$25,000–34,999",
+  "$35,000–44,999", "$45,000–54,999", "$55,000–64,999",
+  "$65,000–74,999", "$20,000 and over (broad)",
+  "Under $20,000 (broad)", "$75,000–99,999", "$100,000 and over"
+)
+income_lower_bounds <- c(
+  `1` = 0, `2` = 5000, `3` = 10000, `4` = 15000,
+  `5` = 20000, `6` = 25000, `7` = 35000, `8` = 45000,
+  `9` = 55000, `10` = 65000, `14` = 75000, `15` = 100000
+)
+
+nhanes$gender <- factor(nhanes$RIAGENDR,
+                        levels = c(2, 1), labels = c("Female", "Male"))
+nhanes$citizenship <- factor(nhanes$DMDCITZN,
+                             levels = c(1, 2),
+                             labels = c("US citizen", "Not US citizen"))
+nhanes$young_children <- as.numeric(nhanes$DMDHHSZA)
+nhanes$young_children[!nhanes$young_children %in% 0:3] <- NA_real_
+nhanes$income_category <- factor(nhanes$INDHHIN2,
+                                 levels = income_codes,
+                                 labels = income_labels)
+nhanes$income_lower_10k <- unname(
+  income_lower_bounds[as.character(nhanes$INDHHIN2)] / 10000
+)
+
+# The AUX_I codebook identifies 555, 777, and 888 as invalid widths.
+nhanes$width_right <- as.numeric(nhanes$AUXTWIDR)
+nhanes$width_left <- as.numeric(nhanes$AUXTWIDL)
+nhanes$width_right[nhanes$width_right %in% c(555, 777, 888)] <- NA_real_
+nhanes$width_left[nhanes$width_left %in% c(555, 777, 888)] <- NA_real_
+
+print(table(nhanes$gender, useNA = "ifany"))
+print(table(nhanes$citizenship, useNA = "ifany"))
+print(table(nhanes$young_children, useNA = "ifany"))
+print(table(nhanes$income_category, useNA = "ifany"))
+print(data.frame(
+  measure = c("Numeric income available", "Broad income codes 12 or 13",
+              "Right width available", "Left width available"),
+  count = c(sum(!is.na(nhanes$income_lower_10k)),
+            sum(nhanes$INDHHIN2 %in% c(12, 13), na.rm = TRUE),
+            sum(!is.na(nhanes$width_right)),
+            sum(!is.na(nhanes$width_left)))
+))
+```
+
+The frequency tables show the cleaned factors, the recorded child-count categories, and all labeled income categories. There are **`r sum(nhanes$INDHHIN2 %in% c(12, 13), na.rm = TRUE)`** records in the overlapping broad income bands among matched respondents. The [AUX_I codebook](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2015/DataFiles/AUX_I.htm) defines 555, 777, and 888 as special width codes; all are set to `NA`, as are file-level missing values.
+
+## 1.3 Four Poisson models
+
+Each model uses its own complete-case sample. IRRs and 95% Wald intervals are exponentiated log-link coefficients. McFadden's pseudo-$R^2$ is $1-\ell_{full}/\ell_{intercept}$, with both likelihoods evaluated on **the same sample**. The Poisson likelihood is used as assigned even though tympanometric width is a measurement; standard Poisson uncertainty can be optimistic under overdispersion.
+
+```{r nhanes-models}
+sample_1r <- nhanes[complete.cases(nhanes[, c("width_right", "gender")]), ]
+sample_2r <- nhanes[complete.cases(nhanes[, c(
+  "width_right", "gender", "citizenship", "young_children",
+  "income_lower_10k")]), ]
+sample_1l <- nhanes[complete.cases(nhanes[, c("width_left", "gender")]), ]
+sample_2l <- nhanes[complete.cases(nhanes[, c(
+  "width_left", "gender", "citizenship", "young_children",
+  "income_lower_10k")]), ]
+
+model_1r <- glm(width_right ~ gender, family = poisson(link = "log"),
+                data = sample_1r)
+model_2r <- glm(width_right ~ gender + citizenship + young_children +
+                  income_lower_10k, family = poisson(link = "log"),
+                data = sample_2r)
+model_1l <- glm(width_left ~ gender, family = poisson(link = "log"),
+                data = sample_1l)
+model_2l <- glm(width_left ~ gender + citizenship + young_children +
+                  income_lower_10k, family = poisson(link = "log"),
+                data = sample_2l)
+
+models <- list(`1R` = model_1r, `2R` = model_2r,
+               `1L` = model_1l, `2L` = model_2l)
+model_samples <- list(`1R` = sample_1r, `2R` = sample_2r,
+                      `1L` = sample_1l, `2L` = sample_2l)
+outcomes <- c(`1R` = "width_right", `2R` = "width_right",
+              `1L` = "width_left", `2L` = "width_left")
+
+term_labels <- c(
+  genderMale = "Male vs female",
+  `citizenshipNot US citizen` = "Noncitizen vs US citizen",
+  young_children = "Young children (per recorded category)",
+  income_lower_10k = "Income lower bound (per $10,000)"
+)
+
+coefficient_rows <- lapply(names(models), function(id) {
+  estimates <- summary(models[[id]])$coefficients
+  terms <- rownames(estimates)
+  predictor_labels <- unname(term_labels[terms])
+  predictor_labels[terms == "(Intercept)"] <-
+    if (id %in% c("1R", "1L")) {
+      "Baseline expected width: female"
+    } else {
+      "Baseline expected width: female, US citizen, 0 children, $0 bound"
+    }
+  stopifnot(!anyNA(predictor_labels))
+  data.frame(
+    Model = id,
+    Predictor = predictor_labels,
+    IRR = exp(estimates[, "Estimate"]),
+    `95% CI lower` = exp(estimates[, "Estimate"] -
+                           1.96 * estimates[, "Std. Error"]),
+    `95% CI upper` = exp(estimates[, "Estimate"] +
+                           1.96 * estimates[, "Std. Error"]),
+    `p-value` = estimates[, "Pr(>|z|)"],
+    check.names = FALSE, row.names = NULL
+  )
+})
+coefficient_table <- do.call(rbind, coefficient_rows)
+coefficient_table$IRR <- sprintf("%.3f", coefficient_table$IRR)
+coefficient_table$`95% CI lower` <- sprintf("%.3f", coefficient_table$`95% CI lower`)
+coefficient_table$`95% CI upper` <- sprintf("%.3f", coefficient_table$`95% CI upper`)
+coefficient_table$`p-value` <- format.pval(
+  coefficient_table$`p-value`, digits = 3, eps = 0.001)
+knitr::kable(coefficient_table, caption = "Exponentiated Poisson coefficients (Wald 95% intervals)",
+             align = c("c", "l", "r", "r", "r", "r"))
+
+model_statistics <- do.call(rbind, lapply(names(models), function(id) {
+  null_model <- glm(reformulate("1", response = outcomes[[id]]),
+                    family = poisson(link = "log"),
+                    data = model_samples[[id]])
+  data.frame(
+    Model = id,
+    `Sample size` = nobs(models[[id]]),
+    `McFadden pseudo-R²` = 1 - as.numeric(logLik(models[[id]])) /
+      as.numeric(logLik(null_model)),
+    AIC = AIC(models[[id]]), check.names = FALSE
+  )
+}))
+knitr::kable(model_statistics, digits = c(0, 0, 4, 1),
+             caption = "Model fit and estimation sample sizes")
+```
+
+Female and US citizen are the reference groups. The intercept rows are **baseline predicted widths**, not IRRs; every other exponentiated coefficient is an IRR. The gender-only models omit citizenship, child count, and income. Model 1R uses **`r nobs(model_1r)`** respondents, 2R **`r nobs(model_2r)`**, 1L **`r nobs(model_1l)`**, and 2L **`r nobs(model_2l)`**. For Model 2L, the male IRR is **`r sprintf('%.3f', exp(coef(model_2l)['genderMale']))`**: at fixed recorded covariates, the model predicts `r if (coef(model_2l)['genderMale'] > 0) 'higher' else 'lower'` mean left-ear width for males than females.
+
+## 1.4 Gender tests from Model 2L
+
+**Test A, coefficient/IRR scale.** $H_0:\beta_{male}=0$ (male IRR = 1) versus $H_A:\beta_{male}\ne0$. Female is the reference. The two-sided Wald test uses the fitted log coefficient and its standard error.
+
+**Test B, response scale.** I compare predicted left-ear widths for male and female respondents while holding citizenship at **US citizen**, young children at **0**, and income lower bound at the **median in Model 2L's estimation sample**. A delta-method Wald interval and test use the model covariance matrix for the difference in predicted means.
+
+```{r nhanes-tests}
+gender_coefficient <- summary(model_2l)$coefficients["genderMale", ]
+gender_irr <- exp(gender_coefficient["Estimate"])
+gender_irr_ci <- exp(gender_coefficient["Estimate"] +
+                       c(-1, 1) * 1.96 * gender_coefficient["Std. Error"])
+test_a <- data.frame(
+  IRR = unname(gender_irr), CI_lower = unname(gender_irr_ci[1]),
+  CI_upper = unname(gender_irr_ci[2]),
+  z = unname(gender_coefficient["z value"]),
+  p_value = unname(gender_coefficient["Pr(>|z|)"])
+)
+test_a_display <- transform(test_a,
+                            p_value = format.pval(p_value, digits = 3,
+                                                  eps = .001))
+knitr::kable(test_a_display, digits = 4,
+             caption = "Test A: male versus female IRR in Model 2L")
+
+median_income <- median(sample_2l$income_lower_10k)
+comparison_data <- data.frame(
+  gender = factor(c("Female", "Male"), levels = levels(sample_2l$gender)),
+  citizenship = factor(rep("US citizen", 2),
+                       levels = levels(sample_2l$citizenship)),
+  young_children = c(0, 0),
+  income_lower_10k = rep(median_income, 2)
+)
+design <- model.matrix(delete.response(terms(model_2l)), comparison_data)
+predicted_width <- as.numeric(exp(design %*% coef(model_2l)))
+gradient <- predicted_width[2] * design[2, ] -
+  predicted_width[1] * design[1, ]
+width_difference <- predicted_width[2] - predicted_width[1]
+difference_se <- sqrt(as.numeric(t(gradient) %*% vcov(model_2l) %*% gradient))
+difference_z <- width_difference / difference_se
+difference_p <- 2 * pnorm(-abs(difference_z))
+test_b <- data.frame(
+  Female_predicted = predicted_width[1],
+  Male_predicted = predicted_width[2],
+  Male_minus_female = width_difference,
+  CI_lower = width_difference - 1.96 * difference_se,
+  CI_upper = width_difference + 1.96 * difference_se,
+  z = difference_z, p_value = difference_p
+)
+test_b_display <- transform(test_b,
+                            p_value = format.pval(p_value, digits = 3,
+                                                  eps = .001))
+knitr::kable(test_b_display, digits = 4,
+             caption = "Test B: fixed-covariate predicted width comparison")
+```
+
+**Test A answer.** The male IRR is **`r sprintf('%.3f', gender_irr)`** (95% CI **`r sprintf('%.3f–%.3f', gender_irr_ci[1], gender_irr_ci[2])`**), $z$ = **`r sprintf('%.3f', gender_coefficient['z value'])`**, $p$ = **`r sprintf('%.2g', gender_coefficient['Pr(>|z|)'])`**. Thus, at the 5% level, the IRR `r if (gender_coefficient['Pr(>|z|)'] < .05) 'differs' else 'does not significantly differ'` from 1; the fitted association points toward `r if (gender_irr > 1) 'greater' else 'smaller'` left-ear width for males.
+
+**Test B answer.** At income lower bound **$`r format(median_income * 10000, big.mark=',', trim=TRUE)`**, zero young children, and US citizenship, predicted width is **`r sprintf('%.2f', predicted_width[1])`** for females and **`r sprintf('%.2f', predicted_width[2])`** for males. The male minus female difference is **`r sprintf('%.2f', width_difference)`** (95% CI **`r sprintf('%.2f–%.2f', test_b$CI_lower, test_b$CI_upper)`**), $z$ = **`r sprintf('%.3f', difference_z)`**, $p$ = **`r sprintf('%.2g', difference_p)`**. The fixed-covariate predicted widths `r if (difference_p < .05) 'differ significantly' else 'do not differ significantly'` at 5%. Since this log-link model has no gender interaction, equality of predictions at identical covariates is mathematically equivalent to $\beta_{male}=0$; these are two views of the same hypothesis, not independent evidence.
+
+# Problem 2 — Sakila SQLite
+
+The database is the [Sakila SQLite port](https://github.com/bradleygrant/sakila-sqlite3). For each question, I compared an R-based approach with a single SQL query and benchmarked their execution times. Timings include query execution and, for the R method, its R computation. They exclude installation and downloads.
+
+```{r sakila-setup}
+con <- DBI::dbConnect(RSQLite::SQLite(), "data/sakila_master.db")
+stopifnot(DBI::dbIsValid(con))
+
+#' Summarize a two-workflow microbenchmark in milliseconds.
+#' @param r_workflow A no-argument function that retrieves data and computes in R.
+#' @param sql_workflow A no-argument function that computes through one SQL query.
+#' @param repetitions Number of repetitions for each workflow.
+#' @return Data frame with median and quartile elapsed times in milliseconds.
+benchmark_workflows <- function(r_workflow, sql_workflow, repetitions = 25L) {
+  timing <- microbenchmark::microbenchmark(
+    SQL_then_R = r_workflow(),
+    Single_SQL = sql_workflow(),
+    times = repetitions, unit = "ms"
+  )
+  elapsed <- as.data.frame(timing)
+  elapsed$milliseconds <- elapsed$time / 1e6
+  result <- do.call(rbind, lapply(split(elapsed$milliseconds, elapsed$expr),
+                                  function(x) data.frame(
+                                    median_ms = median(x),
+                                    q1_ms = unname(quantile(x, .25)),
+                                    q3_ms = unname(quantile(x, .75))
+                                  )))
+  result$Workflow <- rownames(result)
+  rownames(result) <- NULL
+  result[, c("Workflow", "median_ms", "q1_ms", "q3_ms")]
+}
+
+#' Name the faster workflow by its median execution time.
+#' @param timing A benchmark summary made by benchmark_workflows.
+#' @return A readable workflow name.
+faster_workflow <- function(timing) {
+  timing$Workflow[which.min(timing$median_ms)]
+}
+```
+
+## 2.1 Customer counts and active percentages
+
+```{r sakila-customers}
+#' Calculate per-store customer counts with SQL extraction and R aggregation.
+#' @return Data frame with store ID, total and active counts, and active percentage.
+customers_r <- function() {
+  customer <- DBI::dbGetQuery(con,
+    "SELECT store_id, active FROM customer")
+  totals <- aggregate(rep(1L, nrow(customer)),
+                      by = list(store_id = customer$store_id), FUN = sum)
+  active <- aggregate(as.integer(customer$active == 1),
+                      by = list(store_id = customer$store_id), FUN = sum)
+  result <- merge(totals, active, by = "store_id")
+  names(result) <- c("store_id", "customer_count", "active_count")
+  result$active_pct <- 100 * result$active_count / result$customer_count
+  result[order(result$store_id), ]
+}
+
+#' Calculate per-store customer counts entirely in one SQL query.
+#' @return Data frame with store ID, total and active counts, and active percentage.
+customers_sql <- function() {
+  DBI::dbGetQuery(con, "
+    SELECT store_id,
+           COUNT(*) AS customer_count,
+           SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS active_count,
+           100.0 * SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) /
+             COUNT(*) AS active_pct
+    FROM customer
+    GROUP BY store_id
+    ORDER BY store_id")
+}
+
+customer_result_r <- customers_r()
+customer_result_sql <- customers_sql()
+customer_match <- isTRUE(all.equal(customer_result_r, customer_result_sql,
+                                   check.attributes = FALSE))
+stopifnot(customer_match)
+knitr::kable(customer_result_r, digits = c(0, 0, 0, 2),
+             caption = "Customers and active percentages within each store")
+print(data.frame(methods_agree = customer_match))
+customer_timing <- benchmark_workflows(customers_r, customers_sql)
+knitr::kable(customer_timing, digits = 3,
+             caption = "Problem 2.1 benchmark; elapsed milliseconds, 25 runs each")
+```
+
+The denominator is each store's own customer count. The two methods agree exactly (within numeric tolerance). The **`r faster_workflow(customer_timing)`** workflow had the lower median elapsed time for this run.
+
+## 2.2 Staff names and countries
+
+```{r sakila-staff}
+#' Join staff location tables after extracting their underlying columns.
+#' @return Data frame with all staff IDs, names, and countries.
+staff_r <- function() {
+  staff <- DBI::dbGetQuery(con,
+    "SELECT staff_id, first_name, last_name, address_id FROM staff")
+  address <- DBI::dbGetQuery(con,
+    "SELECT address_id, city_id FROM address")
+  city <- DBI::dbGetQuery(con,
+    "SELECT city_id, country_id FROM city")
+  country <- DBI::dbGetQuery(con,
+    "SELECT country_id, country FROM country")
+  joined <- merge(staff, address, by = "address_id", all.x = TRUE)
+  joined <- merge(joined, city, by = "city_id", all.x = TRUE)
+  joined <- merge(joined, country, by = "country_id", all.x = TRUE)
+  result <- data.frame(staff_id = joined$staff_id,
+                       staff_name = paste(joined$first_name, joined$last_name),
+                       country = joined$country)
+  result <- result[order(result$staff_id), ]
+  rownames(result) <- NULL
+  result
+}
+
+#' Join staff location tables in one SQL statement.
+#' @return Data frame with all staff IDs, names, and countries.
+staff_sql <- function() {
+  DBI::dbGetQuery(con, "
+    SELECT s.staff_id,
+           s.first_name || ' ' || s.last_name AS staff_name,
+           co.country AS country
+    FROM staff AS s
+    LEFT JOIN address AS a ON s.address_id = a.address_id
+    LEFT JOIN city AS ci ON a.city_id = ci.city_id
+    LEFT JOIN country AS co ON ci.country_id = co.country_id
+    ORDER BY s.staff_id")
+}
+
+staff_result_r <- staff_r()
+staff_result_sql <- staff_sql()
+staff_match <- isTRUE(all.equal(staff_result_r, staff_result_sql,
+                                check.attributes = FALSE))
+stopifnot(staff_match, nrow(staff_result_r) ==
+            DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM staff")$n)
+knitr::kable(staff_result_r,
+             caption = "Every Sakila staff member and their country")
+print(data.frame(methods_agree = staff_match))
+staff_timing <- benchmark_workflows(staff_r, staff_sql)
+knitr::kable(staff_timing, digits = 3,
+             caption = "Problem 2.2 benchmark; elapsed milliseconds, 25 runs each")
+```
+
+The table identifies all **`r nrow(staff_result_r)`** staff members and their countries. Left joins preserve staff records even if a location link were missing. Both methods agree; **`r faster_workflow(staff_timing)`** had the lower median time.
+
+## 2.3 Film names for the highest-value rental transaction
+
+I interpret “rented for the highest dollar value” as the **largest individual payment amount**, not a film's listed rental rate or its lifetime revenue. The payment connects to a rental, inventory copy, and film. All film titles tied at the maximum payment are retained.
+
+```{r sakila-rental}
+#' Find films associated with the maximum individual rental payment using R joins.
+#' @return Data frame containing the maximum USD amount and all tied film titles.
+rental_r <- function() {
+  payment <- DBI::dbGetQuery(con,
+    "SELECT rental_id, amount FROM payment WHERE rental_id IS NOT NULL")
+  rental <- DBI::dbGetQuery(con,
+    "SELECT rental_id, inventory_id FROM rental")
+  inventory <- DBI::dbGetQuery(con,
+    "SELECT inventory_id, film_id FROM inventory")
+  film <- DBI::dbGetQuery(con,
+    "SELECT film_id, title FROM film")
+  joined <- merge(payment, rental, by = "rental_id")
+  joined <- merge(joined, inventory, by = "inventory_id")
+  joined <- merge(joined, film, by = "film_id")
+  maximum <- max(joined$amount)
+  result <- unique(data.frame(amount_usd = joined$amount[joined$amount == maximum],
+                              film_title = joined$title[joined$amount == maximum]))
+  result <- result[order(result$film_title), ]
+  rownames(result) <- NULL
+  result
+}
+
+#' Find films associated with the maximum individual rental payment in SQL.
+#' @return Data frame containing the maximum USD amount and all tied film titles.
+rental_sql <- function() {
+  DBI::dbGetQuery(con, "
+    SELECT DISTINCT p.amount AS amount_usd, f.title AS film_title
+    FROM payment AS p
+    JOIN rental AS r ON p.rental_id = r.rental_id
+    JOIN inventory AS i ON r.inventory_id = i.inventory_id
+    JOIN film AS f ON i.film_id = f.film_id
+    WHERE p.amount = (
+      SELECT MAX(p2.amount)
+      FROM payment AS p2
+      JOIN rental AS r2 ON p2.rental_id = r2.rental_id
+      JOIN inventory AS i2 ON r2.inventory_id = i2.inventory_id
+      JOIN film AS f2 ON i2.film_id = f2.film_id
+    )
+    ORDER BY f.title")
+}
+
+rental_result_r <- rental_r()
+rental_result_sql <- rental_sql()
+rental_match <- isTRUE(all.equal(rental_result_r, rental_result_sql,
+                                 check.attributes = FALSE))
+stopifnot(rental_match)
+knitr::kable(rental_result_r, digits = 2,
+             caption = "All films tied to the largest single rental payment (USD)")
+print(data.frame(methods_agree = rental_match))
+rental_timing <- benchmark_workflows(rental_r, rental_sql)
+knitr::kable(rental_timing, digits = 3,
+             caption = "Problem 2.3 benchmark; elapsed milliseconds, 25 runs each")
+```
+
+The largest linked rental payment is **$`r sprintf('%.2f', rental_result_r$amount_usd[1])`**. The associated film name`r if (nrow(rental_result_r) > 1) 's are' else ' is'` **`r paste(rental_result_r$film_title, collapse = ', ')`**. Both methods return the same result; **`r faster_workflow(rental_timing)`** had the lower median time.
+
+```{r sakila-close}
+DBI::dbDisconnect(con)
+```
+
+# Problem 3 — Australian sample records
+
+These are **synthetic records** from [BrianDunning.com](https://www.briandunning.com/sample-data/), not real people or companies. All columns are initially read as strings, preserving leading zeros in phone numbers.
+
+```{r australia-import}
+au <- read.csv("data/au-500.csv", colClasses = "character",
+               stringsAsFactors = FALSE)
+print(names(au))
+print(data.frame(records = nrow(au), phone1_class = class(au$phone1),
+                 phone2_class = class(au$phone2)))
+```
+
+## 3.1 Exact `.com` websites
+
+```{r australia-web}
+#' Extract a lower-case host from a web address.
+#' @param url Character vector of URLs or host names.
+#' @return Character vector of hosts, without scheme, port, path, or leading www.
+extract_host <- function(url) {
+  host <- trimws(tolower(url))
+  host <- sub("^[[:alpha:]][[:alnum:]+.-]*://", "", host)
+  host <- sub("^[^@/]*@", "", host)
+  host <- sub("[/?#].*$", "", host)
+  host <- sub(":([0-9]+)$", "", host)
+  sub("^www\\.", "", host)
+}
+
+hosts <- extract_host(au$web)
+valid_web <- !is.na(hosts) & nzchar(hosts)
+exact_com <- valid_web & grepl("\\.com$", hosts)
+web_count <- sum(exact_com)
+web_denominator <- sum(valid_web)
+web_percentage <- 100 * web_count / web_denominator
+print(data.frame(com_websites = web_count,
+                 nonmissing_websites = web_denominator,
+                 percentage_com = web_percentage))
+```
+
+**`r web_count` of `r web_denominator` websites (`r sprintf('%.2f', web_percentage)`%)** have a host ending exactly in `.com`. A `.com.au` host is not counted.
+
+## 3.2 Most common email domain
+
+```{r australia-email}
+email_domains <- tolower(trimws(sub("^.*@", "", au$email)))
+email_domains[is.na(au$email) | !grepl("@", au$email, fixed = TRUE)] <- NA_character_
+domain_counts <- sort(table(email_domains), decreasing = TRUE)
+print(domain_counts)
+top_domain_count <- max(domain_counts)
+top_domains <- names(domain_counts)[domain_counts == top_domain_count]
+knitr::kable(data.frame(domain = top_domains, count = as.integer(top_domain_count)),
+             caption = "Most frequent email domain(s)")
+```
+
+The most common email domain`r if (length(top_domains) > 1) 's are' else ' is'` **`r paste(top_domains, collapse = ', ')`**, appearing **`r top_domain_count`** times.
+
+## 3.3 Company names with eligible nonalphabetic characters
+
+The first regular expression ignores letters, commas, and whitespace. The second also ignores ampersands. The denominator is the number of nonmissing company names.
+
+```{r australia-company}
+valid_company <- !is.na(au$company_name) & nzchar(trimws(au$company_name))
+eligible_a <- valid_company &
+  grepl("[^[:alpha:][:space:],]", au$company_name)
+eligible_b <- valid_company &
+  grepl("[^[:alpha:][:space:],&]", au$company_name)
+company_denominator <- sum(valid_company)
+company_summary <- data.frame(
+  Definition = c("Exclude commas and whitespace",
+                 "Also exclude ampersands"),
+  Eligible = c(sum(eligible_a), sum(eligible_b)),
+  Denominator = company_denominator,
+  Proportion = c(sum(eligible_a), sum(eligible_b)) / company_denominator
+)
+knitr::kable(company_summary, digits = 4,
+             caption = "Proportion of company names with eligible characters")
+```
+
+**Part A:** `r sum(eligible_a)` of `r company_denominator` names have an eligible character, a proportion of **`r sprintf('%.4f', company_summary$Proportion[1])`**. **Part B:** after excluding ampersands too, `r sum(eligible_b)` of `r company_denominator` names qualify, a proportion of **`r sprintf('%.4f', company_summary$Proportion[2])`**.
+
+## 3.4 Reformat both phone columns
+
+```{r australia-phone}
+#' Reformat valid ten-digit Australian numbers as XXXX-XXX-XXX.
+#' @param phone Character vector of original telephone numbers.
+#' @return Character vector with valid numbers reformatted and invalid values NA.
+format_cell_phone <- function(phone) {
+  digits <- gsub("[^0-9]", "", phone)
+  result <- rep(NA_character_, length(phone))
+  valid <- !is.na(digits) & nchar(digits) == 10L
+  result[valid] <- paste0(substr(digits[valid], 1, 4), "-",
+                          substr(digits[valid], 5, 7), "-",
+                          substr(digits[valid], 8, 10))
+  result
+}
+
+au$phone1_cell <- format_cell_phone(au$phone1)
+au$phone2_cell <- format_cell_phone(au$phone2)
+phone1_valid <- !is.na(au$phone1) & nzchar(au$phone1)
+phone2_valid <- !is.na(au$phone2) & nzchar(au$phone2)
+stopifnot(all(grepl("^[0-9]{4}-[0-9]{3}-[0-9]{3}$",
+                   au$phone1_cell[phone1_valid])),
+          all(grepl("^[0-9]{4}-[0-9]{3}-[0-9]{3}$",
+                   au$phone2_cell[phone2_valid])))
+cat("First ten reformatted phone1 values:\n")
+print(head(au$phone1_cell, 10))
+cat("First ten reformatted phone2 values:\n")
+print(head(au$phone2_cell, 10))
+print(data.frame(phone1_formatted = sum(!is.na(au$phone1_cell)),
+                 phone2_formatted = sum(!is.na(au$phone2_cell))))
+```
+
+Both columns were stripped to ten digits and reformatted as `XXXX-XXX-XXX`, preserving any leading zero. The first ten values from **each** column are printed separately, and every nonmissing transformed value passed the format check.
+
+## 3.5 Log apartment number histogram
+
+As instructed, a trailing run of digits in an address is treated as an apartment number, even if the address semantics are ambiguous. Only positive numbers can be logged.
+
+```{r australia-apartment}
+address_has_trailing_number <- !is.na(au$address) &
+  grepl("[0-9]+[[:space:]]*$", au$address)
+apartment_number <- rep(NA_real_, nrow(au))
+apartment_number[address_has_trailing_number] <- as.numeric(
+  sub("^.*?([0-9]+)[[:space:]]*$", "\\1",
+      au$address[address_has_trailing_number], perl = TRUE)
+)
+valid_apartment <- !is.na(apartment_number) & apartment_number > 0
+log_apartment <- log(apartment_number[valid_apartment])
+print(data.frame(addresses = nrow(au), trailing_number = sum(address_has_trailing_number),
+                 positive_apartment = sum(valid_apartment),
+                 zero_or_invalid = sum(address_has_trailing_number) -
+                   sum(valid_apartment)))
+
+hist(log_apartment, breaks = "FD", col = "#3E7899", border = "white",
+     main = "Natural log of extracted apartment numbers",
+     xlab = "ln(apartment number)", ylab = "Number of addresses")
+```
+
+There are **`r sum(valid_apartment)`** usable positive trailing numbers. The log distribution has a median of **`r sprintf('%.2f', median(log_apartment))`**, with an observed range of **`r sprintf('%.2f–%.2f', min(log_apartment), max(log_apartment))`**; The histogram peaks between log values of 4 and 6, with observations spread across a relatively wide range. Addresses lacking a positive terminal number do not enter the plot.
+
+## 3.6 Benford's law and apparent authenticity
+
+The first nonzero digit of each positive extracted apartment number is compared with $P(d)=\log_{10}(1+1/d)$ for digits 1–9. The chi-square goodness-of-fit test uses a simulated $p$-value if any expected count is below five; otherwise it uses the usual asymptotic reference distribution.
+
+```{r australia-benford}
+leading_digit <- as.integer(substr(as.character(apartment_number[valid_apartment]),
+                                   1, 1))
+observed_count <- as.integer(table(factor(leading_digit, levels = 1:9)))
+benford_probability <- log10(1 + 1 / (1:9))
+expected_count <- sum(observed_count) * benford_probability
+benford_table <- data.frame(
+  Digit = 1:9, Observed_n = observed_count,
+  Observed_pct = 100 * observed_count / sum(observed_count),
+  Benford_pct = 100 * benford_probability,
+  Expected_n = expected_count
+)
+knitr::kable(benford_table, digits = c(0, 0, 2, 2, 2),
+             caption = "Leading digits: observed apartment numbers versus Benford's law")
+
+barplot(rbind(benford_table$Observed_pct, benford_table$Benford_pct),
+        beside = TRUE, names.arg = 1:9, col = c("#3E7899", "#E8A14A"),
+        main = "Apartment leading digits versus Benford's law",
+        xlab = "Leading nonzero digit", ylab = "Percent")
+legend("topright", legend = c("Observed", "Benford"),
+       fill = c("#3E7899", "#E8A14A"), bty = "n")
+
+small_expected <- any(expected_count < 5)
+benford_test <- chisq.test(observed_count, p = benford_probability,
+                           simulate.p.value = small_expected, B = 10000)
+print(data.frame(chi_square = unname(benford_test$statistic),
+                 df = if (small_expected) NA_integer_ else
+                   unname(benford_test$parameter),
+                 p_value = benford_test$p.value,
+                 simulated_p = small_expected,
+                 minimum_expected_count = min(expected_count)))
+```
+
+The observed first-digit frequencies are compared with Benford's expected distribution above. The chi-square test gives a statistic of **`r sprintf('%.2f', unname(benford_test$statistic))`** (p = **`r sprintf('%.2g', benford_test$p.value)`**), with a minimum expected count of **`r sprintf('%.2f', min(expected_count))`**. Since the p-value is below 0.05, I reject the null hypothesis that the leading digits follow Benford's law.
+
+Based on this test, the apartment numbers would not pass as convincing real data. However, this does not necessarily mean the numbers are fabricated, since genuine apartment numbers may not follow Benford's law either. The original dataset is also identified as synthetic.
