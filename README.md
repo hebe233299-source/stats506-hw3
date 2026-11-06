@@ -26,7 +26,3 @@ The source files are included, so rendering does not download data. Each code ch
 - [CDC AUX_I data/codebook](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2015/DataFiles/AUX_I.htm) and [CDC DEMO_I data/codebook](https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2015/DataFiles/DEMO_I.htm)
 - [Sakila SQLite repository](https://github.com/bradleygrant/sakila-sqlite3)
 - [Australian sample-data page](https://www.briandunning.com/sample-data/)
-
-## GitHub submission step
-
-No repository remote is configured in the current workspace. Replace the visible `https://github.com/REPLACE-USERNAME/REPLACE-REPOSITORY` placeholder near the top of `homework3.qmd` with the actual public repository URL, re-render, and upload the resulting HTML to Canvas. Do not submit the placeholder link.
